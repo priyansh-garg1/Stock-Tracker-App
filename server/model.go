@@ -1,19 +1,18 @@
 package main
 
-import (
-	"fmt"
-	"time"
-)
+import "time"
 
+// Candle struct represents a single OHLC (High, Low, Open, Close) candle
 type Candle struct {
-	Symbol    string `json:"symbol"`
-	Open      string `json:"open"`
-	Close     string `json:"close"`
-	High      string `json:"high"`
-	Low       string `json:"low"`
-	TimeStamp string `json:"timestamp"`
+	Symbol    string    `json:"symbol"`
+	Open      float64   `json:"open"`
+	Close     float64   `json:"close"`
+	High      float64   `json:"high"`
+	Low       float64   `json:"low"`
+	Timestamp time.Time `json:"timestamp"`
 }
 
+// TempCandle represents an item from the temp candle slice building the candles
 type TempCandle struct {
 	Symbol     string
 	OpenTime   time.Time
@@ -25,11 +24,11 @@ type TempCandle struct {
 	Volume     float64
 }
 
+// Structure of the data that comes from the Finnhub ws api
 type FinnhubMessage struct {
 	Data []TradeData `json:"data"`
-	Type string      `json:"type"`
+	Type string      `json:"type"` // ping | trade
 }
-
 type TradeData struct {
 	Close     []string `json:"c"`
 	Price     float64  `json:"p"`
@@ -38,25 +37,27 @@ type TradeData struct {
 	Volume    int      `json:"v"`
 }
 
+// Data to write to clients connected
 type BroadcastMessage struct {
-	UpdateType UpdateType `json:"updateType"`
-	Candle    *Candle  `json:"candle"`
+	UpdateType UpdateType `json:"updateType"` // "live" | "closed"
+	Candle     *Candle    `json:"candle"`
 }
 
 type UpdateType string
 
 const (
-	Live UpdateType = "live"
-	Closed UpdateType = "closed"
+	Live   UpdateType = "live"   // Real time ongoing candle
+	Closed UpdateType = "closed" // Past candle. Already closed
 )
 
+// Converts a tempCandle into a Candle
 func (tc *TempCandle) toCandle() *Candle {
 	return &Candle{
 		Symbol:    tc.Symbol,
-		Open:      fmt.Sprintf("%f",tc.OpenPrice),
-		Close:     fmt.Sprintf("%f",tc.ClosePrice),
-		High:      fmt.Sprintf("%f",tc.HighPrice),
-		Low:       fmt.Sprintf("%f",tc.LowPrice),
-		TimeStamp: fmt.Sprintf("%t",tc.CloseTime),
+		Open:      tc.OpenPrice,
+		Close:     tc.ClosePrice,
+		High:      tc.HighPrice,
+		Low:       tc.LowPrice,
+		Timestamp: tc.CloseTime,
 	}
 }

@@ -13,13 +13,14 @@ import (
 )
 
 var (
-	symbols = []string{"AAPL", "AMZN"}
+	symbols = []string{"AAPL", "AMZN", "TSLA", "GOOGL", "NFLX", "PYPL"}
 
-	tempCandles = make(map[string]*TempCandle)
+	
+	broadcast = make(chan *BroadcastMessage)
 
 	clientConns = make(map[*websocket.Conn]string)
 
-	broadcast = make(chan *BroadcastMessage)
+	tempCandles = make(map[string]*TempCandle)
 
 	mu sync.Mutex
 )
@@ -46,7 +47,7 @@ func main() {
 		CandlesHandler(w, r, db)
 	})
 
-	http.ListenAndServe(fmt.Sprintf(":%s", env.ServerPort), nil)
+	http.ListenAndServe(fmt.Sprintf(":%s", env.SERVER_PORT), nil)
 }
 
 func WSHandler(w http.ResponseWriter, r *http.Request) {
@@ -55,56 +56,63 @@ func WSHandler(w http.ResponseWriter, r *http.Request) {
 			return true
 		},
 	}
-
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Printf("Error upgrading the connection: %e", err)
-		return
+		log.Println("Failed to upgrate connection:", err)
 	}
 
 	defer conn.Close()
 	defer func() {
 		delete(clientConns, conn)
-		log.Println("Client Disconnected")
+		log.Println("Client disconnected!")
 	}()
 
 	for {
 		_, symbol, err := conn.ReadMessage()
 		clientConns[conn] = string(symbol)
-		log.Printf("New Client Connected ")
+		log.Println("New Client Connected!")
 
 		if err != nil {
-			log.Printf("Error reading message from client: %e", err)
+			log.Println("Error reading from the client:", err)
 			break
 		}
 	}
 }
+
 func StocksHistoryHandler(w http.ResponseWriter, r *http.Request, db *gorm.DB) {
 	var candles []Candle
 	db.Order("timestamp asc").Find(&candles)
 
 	groupedData := make(map[string][]Candle)
 
+	// Group the candles by symbol
 	for _, candle := range candles {
-		groupedData[candle.Symbol] = append(groupedData[candle.Symbol], candle)
+		symbol := candle.Symbol
+		groupedData[symbol] = append(groupedData[symbol], candle)
 	}
 
+	// Marshal the grouped data into JSON and send over http
 	jsonResponse, _ := json.Marshal(groupedData)
 	w.Header().Set("Content-Type", "application/json")
 	w.Write(jsonResponse)
 }
 
+// Fetch all past candles from a specific symbol
 func CandlesHandler(w http.ResponseWriter, r *http.Request, db *gorm.DB) {
+	// Get the symbol from the query
 	symbol := r.URL.Query().Get("symbol")
 
+	// Query the db for all candle data for that symbol
 	var candles []Candle
 	db.Where("symbol = ?", symbol).Order("timestamp asc").Find(&candles)
 
+	// Marshal the candles data into JSON and send over http
 	jsonCandles, _ := json.Marshal(candles)
 	w.Header().Set("Content-Type", "application/json")
 	w.Write(jsonCandles)
 }
 
+// Connect to Finnhub WebSockets
 func connectToFinnhub(env *Env) *websocket.Conn {
 	ws, _, err := websocket.DefaultDialer.Dial(fmt.Sprintf("wss://ws.finnhub.io?token=%s", env.API_KEY), nil)
 	if err != nil {
@@ -119,50 +127,65 @@ func connectToFinnhub(env *Env) *websocket.Conn {
 	return ws
 }
 
+// Handle Finnhub's WebSockets incoming messages
 func handleFinnhubMessages(ws *websocket.Conn, db *gorm.DB) {
-
 	finnhubMessage := &FinnhubMessage{}
 
 	for {
 		if err := ws.ReadJSON(finnhubMessage); err != nil {
-			fmt.Printf("Error reading the message: %e", err)
+			fmt.Println("Error reading the message: ", err)
 			continue
 		}
 
+		// Only try to process the message data if it's a trade operation
 		if finnhubMessage.Type == "trade" {
 			for _, trade := range finnhubMessage.Data {
+				// Process the trade data
 				processTradeData(&trade, db)
 			}
 		}
-	}
 
+		// Clean up old trades older than 20 minutes
+		cutoffTime := time.Now().Add(-20 * time.Minute)
+		db.Where("timestamp < ?", cutoffTime).Delete(&Candle{})
+	}
 }
 
+// Process each trade and update or create temporary candles
 func processTradeData(trade *TradeData, db *gorm.DB) {
+	// Protect the goroutine from data races
 	mu.Lock()
 	defer mu.Unlock()
 
+	// Extract trade data
 	symbol := trade.Symbol
 	price := trade.Price
-	volume := trade.Volume
+	volume := float64(trade.Volume)
 	timestamp := time.UnixMilli(trade.Timestamp)
 
+	// Retrieve or create a tempCandle for the symbol
 	tempCandle, exists := tempCandles[symbol]
 
+	// If the tempCandle does not exist or should be already closed
 	if !exists || timestamp.After(tempCandle.CloseTime) {
+		// Finalize and save the previous candle, start a new one
 		if exists {
+			// Convert the tempCandle to a Candle
 			candle := tempCandle.toCandle()
 
+			// Save the candle to the db
 			if err := db.Create(candle).Error; err != nil {
-				fmt.Println("Error creating candle to DB: ", err)
+				fmt.Println("Error saving the candle to the DB: ", err)
 			}
 
+			// Broadcast the closed candle
 			broadcast <- &BroadcastMessage{
 				UpdateType: Closed,
 				Candle:     candle,
 			}
 		}
 
+		// Initialize a new candle
 		tempCandle = &TempCandle{
 			Symbol:     symbol,
 			OpenTime:   timestamp,
@@ -171,61 +194,75 @@ func processTradeData(trade *TradeData, db *gorm.DB) {
 			ClosePrice: price,
 			HighPrice:  price,
 			LowPrice:   price,
-			Volume:     float64(volume),
+			Volume:     volume,
 		}
 	}
 
+	// Update current tempCandle with new trade data
 	tempCandle.ClosePrice = price
-	tempCandle.Volume += float64(volume)
-	if price < tempCandle.HighPrice {
+	tempCandle.Volume += volume
+	if price > tempCandle.HighPrice {
 		tempCandle.HighPrice = price
 	}
 	if price < tempCandle.LowPrice {
 		tempCandle.LowPrice = price
 	}
 
+	// Store the tempCandle for the symbol
 	tempCandles[symbol] = tempCandle
 
+	// Write to the broadcast channel live ongoing channel
 	broadcast <- &BroadcastMessage{
 		UpdateType: Live,
 		Candle:     tempCandle.toCandle(),
 	}
-
 }
 
+// Send candle updates to clients connected every 1 second at maximum, unless it's a closed candle
 func broadcastUpdates() {
-	ticket := time.NewTicker(1 * time.Second)
-	defer ticket.Stop()
+	// Set the broadcast interval to 1 second
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
 
 	var latestUpdate *BroadcastMessage
 
 	for {
 		select {
+		// Watch for new updates from the broadcast channel
 		case update := <-broadcast:
+			// If the update is a closed candle, broadcast it immediatly
 			if update.UpdateType == Closed {
-				broadcastToClient(update)
-
+				// Broadcast it
+				broadcastToClients(update)
 			} else {
+				// replace temp updates
 				latestUpdate = update
 			}
 
-		case <-ticket.C:
+		case <-ticker.C:
+			// Broadcast the latest update
 			if latestUpdate != nil {
-				broadcastToClient(latestUpdate)
+				// Broadcast it
+				broadcastToClients(latestUpdate)
 			}
 			latestUpdate = nil
 		}
 	}
 }
 
-func broadcastToClient(update *BroadcastMessage) {
+// Broadcast updates to clients
+func broadcastToClients(update *BroadcastMessage) {
+	// Marshal the update struct into json
 	jsonUpdate, _ := json.Marshal(update)
 
+	// Send the update to all connected clients subscribed to the symbol
 	for clientConn, symbol := range clientConns {
+		// If the client is subscribed to the symbol of the update
 		if update.Candle.Symbol == symbol {
+			// Send the update to the client
 			err := clientConn.WriteMessage(websocket.TextMessage, jsonUpdate)
 			if err != nil {
-				log.Printf("Error sending message to client: %e", err)
+				log.Println("Error sending message to client: ", err)
 				clientConn.Close()
 				delete(clientConns, clientConn)
 			}
